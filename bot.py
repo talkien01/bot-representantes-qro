@@ -286,7 +286,15 @@ async def paso_confirma(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data["chat_id"] = update.effective_chat.id
     data["solicitante"] = f"{u.full_name} (@{u.username})" if u.username else u.full_name
     data.setdefault("evidencia_file_id", None)
-    s = await db.crear_ticket(data)
+    try:
+        s = await db.crear_ticket(data)
+    except Exception as e:
+        log.exception("Error al crear ticket: %s", e)
+        await q.edit_message_text(
+            "⚠️ Ocurrió un error al guardar tu ticket. Vuelve a intentar con /ayuda "
+            "en un momento. Si sigue fallando, avísale al soporte."
+        )
+        return ConversationHandler.END
     context.user_data.clear()
 
     await q.edit_message_text(
@@ -478,6 +486,11 @@ def main():
     app.add_handler(CommandHandler("export", export))
     app.add_handler(CallbackQueryHandler(menu_go, pattern=r"^go:(estatus|mis)$"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, start))
+
+    async def on_error(update, context):
+        log.exception("Excepción en un handler", exc_info=context.error)
+
+    app.add_error_handler(on_error)
 
     log.info("Bot iniciando (polling)...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)

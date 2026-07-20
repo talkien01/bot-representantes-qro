@@ -2,6 +2,20 @@
 -- Los comités dan de alta a sus RG/RC en la plataforma oficial; este bot registra
 -- TICKETS de soporte cuando algo les falla. Se ejecuta solo al arrancar (db.py).
 
+-- Migración: la 1a versión del bot ("solicitudes") creó una tabla historial con la
+-- columna solicitud_id. Al cambiar al modelo de tickets, esa tabla vieja rompe los
+-- INSERT en historial(ticket_id,...). Si existe la estructura vieja, la eliminamos
+-- para que abajo se recree con ticket_id. (Los datos de historial se regeneran.)
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name = 'historial' AND column_name = 'solicitud_id'
+  ) THEN
+    DROP TABLE IF EXISTS historial CASCADE;
+  END IF;
+END $$;
+
 CREATE TABLE IF NOT EXISTS tickets (
     id                SERIAL PRIMARY KEY,
     folio             TEXT UNIQUE,
