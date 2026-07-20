@@ -16,6 +16,7 @@ Comandos de administrador (IDs en ADMIN_IDS):
   /export                - CSV con todo
 """
 import csv
+import html
 import io
 import logging
 import os
@@ -45,6 +46,13 @@ COMITE, MOV, REP, NOMBRE, CLAVE, CASILLA, OBS, CONFIRMA = range(8)
 
 SALTAR = "-"  # texto para omitir un campo opcional
 
+HTML = ParseMode.HTML
+
+
+def esc(x) -> str:
+    """Escapa texto para HTML de Telegram. Evita romper el formato con < > &."""
+    return html.escape(str(x)) if x is not None else ""
+
 
 def es_admin(update: Update) -> bool:
     return update.effective_user and update.effective_user.id in ADMIN_IDS
@@ -53,21 +61,21 @@ def es_admin(update: Update) -> bool:
 def ficha(s: dict) -> str:
     e = db.ESTADO_EMOJI.get(s["estado"], "")
     lineas = [
-        f"*Folio:* `{s['folio']}`",
-        f"*Estado:* {e} {s['estado']}",
-        f"*Comité:* {s['comite']}",
-        f"*Movimiento:* {s['tipo_movimiento']} — Rep. {s['tipo_rep']}",
-        f"*Nombre:* {s['nombre']}",
+        f"<b>Folio:</b> <code>{esc(s['folio'])}</code>",
+        f"<b>Estado:</b> {e} {esc(s['estado'])}",
+        f"<b>Comité:</b> {esc(s['comite'])}",
+        f"<b>Movimiento:</b> {esc(s['tipo_movimiento'])} — Rep. {esc(s['tipo_rep'])}",
+        f"<b>Nombre:</b> {esc(s['nombre'])}",
     ]
     if s.get("clave_elector"):
-        lineas.append(f"*Clave de elector:* {s['clave_elector']}")
+        lineas.append(f"<b>Clave de elector:</b> {esc(s['clave_elector'])}")
     if s.get("casilla_ruta"):
-        lineas.append(f"*Casilla/Ruta:* {s['casilla_ruta']}")
+        lineas.append(f"<b>Casilla/Ruta:</b> {esc(s['casilla_ruta'])}")
     if s.get("observaciones"):
-        lineas.append(f"*Observaciones:* {s['observaciones']}")
+        lineas.append(f"<b>Observaciones:</b> {esc(s['observaciones'])}")
     if s.get("nota_admin"):
-        lineas.append(f"*Nota del CDE:* {s['nota_admin']}")
-    lineas.append(f"*Recibida:* {s['creada_en']:%d/%m/%Y %H:%M}")
+        lineas.append(f"<b>Nota del CDE:</b> {esc(s['nota_admin'])}")
+    lineas.append(f"<b>Recibida:</b> {s['creada_en']:%d/%m/%Y %H:%M}")
     return "\n".join(lineas)
 
 
@@ -75,7 +83,7 @@ def ficha(s: dict) -> str:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = (
-        "👋 Hola, soy el bot de *solicitudes de representantes* del PAN Querétaro.\n\n"
+        "👋 Hola, soy el bot de <b>solicitudes de representantes</b> del PAN Querétaro.\n\n"
         "📝 /nueva — registrar alta, baja o sustitución (te doy un folio)\n"
         "🔎 /estatus — consultar un folio\n"
         "📋 /mis — tus últimas solicitudes\n"
@@ -83,15 +91,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     if es_admin(update):
         txt += (
-            "\n\n🛠 *Administrador:*\n"
+            "\n\n🛠 <b>Administrador:</b>\n"
             "/pendientes — solicitudes abiertas\n"
             "/detalle FOLIO — ficha e historial\n"
-            "/actualizar FOLIO ESTADO \\[nota] — cambia estado y notifica\n"
+            "/actualizar FOLIO ESTADO [nota] — cambia estado y notifica\n"
             "/resumen — conteo por estado\n"
             "/export — CSV completo\n"
-            f"\nEstados válidos: {', '.join(db.ESTADOS)}"
+            f"\nEstados válidos: {esc(', '.join(db.ESTADOS))}"
         )
-    await update.message.reply_text(txt, parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text(txt, parse_mode=HTML)
 
 
 async def estatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -100,7 +108,7 @@ async def estatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not s:
             await update.message.reply_text("No encontré ese folio. Verifica que esté completo, ej. QRO-2607-0001")
             return
-        await update.message.reply_text(ficha(s), parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(ficha(s), parse_mode=HTML)
     else:
         await update.message.reply_text("Uso: /estatus QRO-2607-0001")
 
@@ -111,10 +119,11 @@ async def mis(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("No tienes solicitudes registradas. Usa /nueva para crear una.")
         return
     lineas = [
-        f"{db.ESTADO_EMOJI.get(s['estado'],'')} `{s['folio']}` — {s['tipo_movimiento']} {s['tipo_rep']} — {s['nombre']} — {s['estado']}"
+        f"{db.ESTADO_EMOJI.get(s['estado'],'')} <code>{esc(s['folio'])}</code> — "
+        f"{esc(s['tipo_movimiento'])} {esc(s['tipo_rep'])} — {esc(s['nombre'])} — {esc(s['estado'])}"
         for s in filas
     ]
-    await update.message.reply_text("\n".join(lineas), parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text("\n".join(lineas), parse_mode=HTML)
 
 
 # ---------- wizard /nueva ----------
@@ -122,8 +131,8 @@ async def mis(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def nueva(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     await update.message.reply_text(
-        "📝 Nueva solicitud.\n\n¿De qué *comité* (distrital o municipal) es la solicitud?",
-        parse_mode=ParseMode.MARKDOWN,
+        "📝 Nueva solicitud.\n\n¿De qué <b>comité</b> (distrital o municipal) es la solicitud?",
+        parse_mode=HTML,
     )
     return COMITE
 
@@ -186,18 +195,18 @@ async def paso_obs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     d = context.user_data
     resumen = (
         "Confirma la solicitud:\n\n"
-        f"*Comité:* {d['comite']}\n"
-        f"*Movimiento:* {d['tipo_movimiento']} — Rep. {d['tipo_rep']}\n"
-        f"*Nombre:* {d['nombre']}\n"
-        f"*Clave de elector:* {d.get('clave_elector') or '—'}\n"
-        f"*Casilla/Ruta:* {d.get('casilla_ruta') or '—'}\n"
-        f"*Observaciones:* {d.get('observaciones') or '—'}"
+        f"<b>Comité:</b> {esc(d['comite'])}\n"
+        f"<b>Movimiento:</b> {esc(d['tipo_movimiento'])} — Rep. {esc(d['tipo_rep'])}\n"
+        f"<b>Nombre:</b> {esc(d['nombre'])}\n"
+        f"<b>Clave de elector:</b> {esc(d.get('clave_elector') or '—')}\n"
+        f"<b>Casilla/Ruta:</b> {esc(d.get('casilla_ruta') or '—')}\n"
+        f"<b>Observaciones:</b> {esc(d.get('observaciones') or '—')}"
     )
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Enviar", callback_data="conf:si"),
          InlineKeyboardButton("❌ Cancelar", callback_data="conf:no")],
     ])
-    await update.message.reply_text(resumen, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+    await update.message.reply_text(resumen, parse_mode=HTML, reply_markup=kb)
     return CONFIRMA
 
 
@@ -217,9 +226,9 @@ async def paso_confirma(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
 
     await q.edit_message_text(
-        f"✅ Solicitud registrada.\n\n*Tu folio es:* `{s['folio']}`\n\n"
+        f"✅ Solicitud registrada.\n\n<b>Tu folio es:</b> <code>{esc(s['folio'])}</code>\n\n"
         "Guárdalo para dar seguimiento con /estatus. Te notificaré aquí cada cambio de estado.",
-        parse_mode=ParseMode.MARKDOWN,
+        parse_mode=HTML,
     )
 
     # avisar a los administradores
@@ -227,8 +236,8 @@ async def paso_confirma(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await context.bot.send_message(
                 admin_id,
-                f"📥 Nueva solicitud `{s['folio']}` de {data['solicitante']}\n\n" + ficha(s),
-                parse_mode=ParseMode.MARKDOWN,
+                f"📥 Nueva solicitud <code>{esc(s['folio'])}</code> de {esc(data['solicitante'])}\n\n" + ficha(s),
+                parse_mode=HTML,
             )
         except Exception as e:
             log.warning("No pude avisar al admin %s: %s", admin_id, e)
@@ -251,12 +260,12 @@ async def pendientes(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🎉 No hay solicitudes pendientes.")
         return
     lineas = [
-        f"{db.ESTADO_EMOJI.get(s['estado'],'')} `{s['folio']}` — {s['comite']} — "
-        f"{s['tipo_movimiento']} {s['tipo_rep']} — {s['nombre']} — {s['estado']}"
+        f"{db.ESTADO_EMOJI.get(s['estado'],'')} <code>{esc(s['folio'])}</code> — {esc(s['comite'])} — "
+        f"{esc(s['tipo_movimiento'])} {esc(s['tipo_rep'])} — {esc(s['nombre'])} — {esc(s['estado'])}"
         for s in filas
     ]
     await update.message.reply_text(
-        f"*{len(filas)} pendientes:*\n\n" + "\n".join(lineas), parse_mode=ParseMode.MARKDOWN
+        f"<b>{len(filas)} pendientes:</b>\n\n" + "\n".join(lineas), parse_mode=HTML
     )
 
 
@@ -271,12 +280,12 @@ async def detalle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Folio no encontrado.")
         return
     hist = await db.historial_de(s["id"])
-    txt = ficha(s) + f"\n*Solicitante:* {s['solicitante']}\n\n*Historial:*\n"
+    txt = ficha(s) + f"\n<b>Solicitante:</b> {esc(s['solicitante'])}\n\n<b>Historial:</b>\n"
     txt += "\n".join(
-        f"• {h['fecha']:%d/%m %H:%M} — {h['estado']}" + (f" ({h['nota']})" if h["nota"] else "")
+        f"• {h['fecha']:%d/%m %H:%M} — {esc(h['estado'])}" + (f" ({esc(h['nota'])})" if h["nota"] else "")
         for h in hist
     )
-    await update.message.reply_text(txt, parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text(txt, parse_mode=HTML)
 
 
 async def actualizar(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -299,13 +308,15 @@ async def actualizar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Folio no encontrado.")
         return
     e = db.ESTADO_EMOJI.get(estado, "")
-    await update.message.reply_text(f"{e} `{s['folio']}` → *{estado}*", parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text(
+        f"{e} <code>{esc(s['folio'])}</code> → <b>{esc(estado)}</b>", parse_mode=HTML
+    )
     # notificar al solicitante
     try:
-        msg = f"{e} Tu solicitud `{s['folio']}` cambió a *{estado}*."
+        msg = f"{e} Tu solicitud <code>{esc(s['folio'])}</code> cambió a <b>{esc(estado)}</b>."
         if nota:
-            msg += f"\nNota: {nota}"
-        await context.bot.send_message(s["chat_id"], msg, parse_mode=ParseMode.MARKDOWN)
+            msg += f"\nNota: {esc(nota)}"
+        await context.bot.send_message(s["chat_id"], msg, parse_mode=HTML)
     except Exception as ex:
         log.warning("No pude notificar al solicitante de %s: %s", folio, ex)
         await update.message.reply_text("⚠️ No pude notificar al solicitante (quizá bloqueó el bot).")
@@ -316,9 +327,9 @@ async def resumen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     filas = await db.resumen()
     total = sum(r["n"] for r in filas)
-    lineas = [f"{db.ESTADO_EMOJI.get(r['estado'],'')} {r['estado']}: *{r['n']}*" for r in filas]
+    lineas = [f"{db.ESTADO_EMOJI.get(r['estado'],'')} {esc(r['estado'])}: <b>{r['n']}</b>" for r in filas]
     await update.message.reply_text(
-        f"*Resumen ({total} solicitudes):*\n\n" + "\n".join(lineas), parse_mode=ParseMode.MARKDOWN
+        f"<b>Resumen ({total} solicitudes):</b>\n\n" + "\n".join(lineas), parse_mode=HTML
     )
 
 
