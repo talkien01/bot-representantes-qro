@@ -46,6 +46,16 @@ COMITE, MOV, REP, NOMBRE, CLAVE, CASILLA, OBS, CONFIRMA = range(8)
 
 SALTAR = "-"  # texto para omitir un campo opcional
 
+# Comités municipales de Querétaro (18 municipios).
+# Para cambiar a distritos, solo edita esta lista.
+COMITES = [
+    "Amealco de Bonfil", "Arroyo Seco", "Cadereyta de Montes", "Colón",
+    "Corregidora", "El Marqués", "Ezequiel Montes", "Huimilpan",
+    "Jalpan de Serra", "Landa de Matamoros", "Pedro Escobedo", "Peñamiller",
+    "Pinal de Amoles", "Querétaro", "San Joaquín", "San Juan del Río",
+    "Tequisquiapan", "Tolimán",
+]
+
 HTML = ParseMode.HTML
 
 
@@ -81,13 +91,26 @@ def ficha(s: dict) -> str:
 
 # ---------- comandos generales ----------
 
+def _menu_bienvenida() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📝 Nueva solicitud", callback_data="go:nueva")],
+        [InlineKeyboardButton("🔎 Consultar folio", callback_data="go:estatus"),
+         InlineKeyboardButton("📋 Mis solicitudes", callback_data="go:mis")],
+    ])
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Bienvenida. Se dispara con /start y también con cualquier saludo/texto suelto."""
     txt = (
-        "👋 Hola, soy el bot de <b>solicitudes de representantes</b> del PAN Querétaro.\n\n"
-        "📝 /nueva — registrar alta, baja o sustitución (te doy un folio)\n"
-        "🔎 /estatus — consultar un folio\n"
-        "📋 /mis — tus últimas solicitudes\n"
-        "✖️ /cancelar — cancelar la captura en curso"
+        "👋 <b>¡Hola! Bienvenido.</b>\n\n"
+        "Soy el bot de <b>solicitudes de representantes</b> del PAN Querétaro. "
+        "Aquí los comités registran <b>altas, bajas y sustituciones</b> de representantes "
+        "generales y de casilla, y cada solicitud recibe un <b>folio</b> para darle seguimiento.\n\n"
+        "<b>¿Cómo funciona?</b>\n"
+        "1️⃣ Toca <b>📝 Nueva solicitud</b> (o escribe /nueva).\n"
+        "2️⃣ Elige tu municipio y responde unas preguntas cortas.\n"
+        "3️⃣ Recibes tu folio y te aviso aquí en cuanto avance tu trámite.\n\n"
+        "También puedes escribir <b>/estatus</b> con tu folio para consultar en cualquier momento."
     )
     if es_admin(update):
         txt += (
@@ -99,7 +122,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/export — CSV completo\n"
             f"\nEstados válidos: {esc(', '.join(db.ESTADOS))}"
         )
-    await update.message.reply_text(txt, parse_mode=HTML)
+    dest = update.message or (update.callback_query and update.callback_query.message)
+    await dest.reply_text(txt, parse_mode=HTML, reply_markup=_menu_bienvenida())
+
+
+async def menu_go(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Botones de la bienvenida que no arrancan el wizard (estatus / mis)."""
+    q = update.callback_query
+    await q.answer()
+    if q.data == "go:estatus":
+        await q.message.reply_text("Escribe: /estatus seguido de tu folio.\nEjemplo: /estatus QRO-2607-0001")
+    elif q.data == "go:mis":
+        await mis(update, context)
 
 
 async def estatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -114,37 +148,61 @@ async def estatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def mis(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    dest = update.message or (update.callback_query and update.callback_query.message)
     filas = await db.solicitudes_de_chat(update.effective_chat.id)
     if not filas:
-        await update.message.reply_text("No tienes solicitudes registradas. Usa /nueva para crear una.")
+        await dest.reply_text("No tienes solicitudes registradas. Usa /nueva para crear una.")
         return
     lineas = [
         f"{db.ESTADO_EMOJI.get(s['estado'],'')} <code>{esc(s['folio'])}</code> — "
         f"{esc(s['tipo_movimiento'])} {esc(s['tipo_rep'])} — {esc(s['nombre'])} — {esc(s['estado'])}"
         for s in filas
     ]
-    await update.message.reply_text("\n".join(lineas), parse_mode=HTML)
+    await dest.reply_text("\n".join(lineas), parse_mode=HTML)
 
 
 # ---------- wizard /nueva ----------
 
+def _teclado_comites() -> InlineKeyboardMarkup:
+    """Botones de comités en 2 columnas (usa el índice para evitar textos largos)."""
+    filas, fila = [], []
+    for i, nombre in enumerate(COMITES):
+        fila.append(InlineKeyboardButton(nombre, callback_data=f"com:{i}"))
+        if len(fila) == 2:
+            filas.append(fila)
+            fila = []
+    if fila:
+        filas.append(fila)
+    return InlineKeyboardMarkup(filas)
+
+
 async def nueva(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
-    await update.message.reply_text(
-        "📝 Nueva solicitud.\n\n¿De qué <b>comité</b> (distrital o municipal) es la solicitud?",
+    if update.callback_query:
+        await update.callback_query.answer()
+        dest = update.callback_query.message
+    else:
+        dest = update.message
+    await dest.reply_text(
+        "📝 Nueva solicitud.\n\nSelecciona el <b>comité municipal</b>:",
         parse_mode=HTML,
+        reply_markup=_teclado_comites(),
     )
     return COMITE
 
 
 async def paso_comite(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["comite"] = update.message.text.strip()
+    q = update.callback_query
+    await q.answer()
+    idx = int(q.data.split(":")[1])
+    context.user_data["comite"] = COMITES[idx]
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("⬆️ Alta", callback_data="mov:ALTA"),
          InlineKeyboardButton("⬇️ Baja", callback_data="mov:BAJA"),
          InlineKeyboardButton("🔁 Sustitución", callback_data="mov:SUSTITUCION")],
     ])
-    await update.message.reply_text("¿Qué tipo de movimiento es?", reply_markup=kb)
+    await q.edit_message_text(f"Comité: <b>{esc(COMITES[idx])}</b>", parse_mode=HTML)
+    await q.message.reply_text("¿Qué tipo de movimiento es?", reply_markup=kb)
     return MOV
 
 
@@ -354,6 +412,15 @@ async def export(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def post_init(app: Application):
     await db.init_db()
     log.info("Base de datos lista.")
+    # Menú azul de comandos (botón "/" junto al teclado)
+    from telegram import BotCommand
+    await app.bot.set_my_commands([
+        BotCommand("nueva", "Registrar una solicitud"),
+        BotCommand("estatus", "Consultar un folio"),
+        BotCommand("mis", "Mis solicitudes"),
+        BotCommand("cancelar", "Cancelar captura en curso"),
+        BotCommand("start", "Ayuda / inicio"),
+    ])
 
 
 async def post_shutdown(app: Application):
@@ -370,9 +437,12 @@ def main():
     )
 
     wizard = ConversationHandler(
-        entry_points=[CommandHandler("nueva", nueva)],
+        entry_points=[
+            CommandHandler("nueva", nueva),
+            CallbackQueryHandler(nueva, pattern=r"^go:nueva$"),
+        ],
         states={
-            COMITE: [MessageHandler(filters.TEXT & ~filters.COMMAND, paso_comite)],
+            COMITE: [CallbackQueryHandler(paso_comite, pattern=r"^com:")],
             MOV: [CallbackQueryHandler(paso_mov, pattern=r"^mov:")],
             REP: [CallbackQueryHandler(paso_rep, pattern=r"^rep:")],
             NOMBRE: [MessageHandler(filters.TEXT & ~filters.COMMAND, paso_nombre)],
@@ -393,6 +463,10 @@ def main():
     app.add_handler(CommandHandler("actualizar", actualizar))
     app.add_handler(CommandHandler("resumen", resumen_cmd))
     app.add_handler(CommandHandler("export", export))
+    # Botones de la bienvenida (estatus / mis)
+    app.add_handler(CallbackQueryHandler(menu_go, pattern=r"^go:(estatus|mis)$"))
+    # Cualquier saludo o texto suelto fuera del wizard → muestra la bienvenida
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, start))
 
     log.info("Bot iniciando (polling)...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
