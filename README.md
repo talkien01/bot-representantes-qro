@@ -1,61 +1,70 @@
-# Bot de solicitudes de representantes — PAN Querétaro
+# Mesa de ayuda de representantes — PAN Querétaro
 
-Bot de Telegram para que los comités distritales/municipales registren solicitudes de **alta, baja o sustitución** de representantes generales y de casilla. Cada solicitud recibe un **folio** (`QRO-AAMM-0001`), queda en Postgres con historial, y el comité recibe notificación automática en cada cambio de estado.
+Bot de Telegram tipo **help desk**: los comités municipales dan de alta a sus representantes generales (RG) y de casilla (RC) **directamente en la plataforma oficial**; este bot **no hace las altas**, sino que registra **tickets de soporte** cuando algo les falla (no pueden dar de alta un RG, la ruta no es válida, error del sistema, ayuda con RC).
+
+Cada ticket recibe un **folio** (`QRO-AAMM-0001`), queda en Postgres con historial y evidencia opcional, y quien reporta recibe notificación automática en cada cambio de estado.
 
 ## Flujo
 
-1. El comité envía `/nueva` al bot → wizard guiado (comité, movimiento, tipo de rep., nombre, clave de elector, casilla/ruta, observaciones) → recibe su folio.
-2. Tú (admin) recibes aviso inmediato de cada solicitud nueva.
-3. La procesas en el sistema del INE y actualizas: `/actualizar QRO-2607-0001 PROCESADA` → el comité recibe la notificación.
-4. Estados: `RECIBIDA → EN_PROCESO → PROCESADA → CONFIRMADA` (o `RECHAZADA` con nota).
+1. El comité escribe cualquier mensaje ("hola") o `/ayuda` → wizard: municipio → tipo de problema → descripción → captura opcional (cámara o galería) → recibe su folio.
+2. Tú (soporte) recibes el ticket al instante, con la evidencia si la adjuntaron.
+3. Atiendes: `/actualizar QRO-2607-0001 EN_ATENCION` → el comité recibe la notificación.
+4. Estados: `RECIBIDO → EN_ATENCION → RESUELTO` (o `ESCALADO` / `CERRADO`).
 
 ## Comandos
 
 | Comando | Quién | Descripción |
 |---|---|---|
-| `/nueva` | Comités | Registrar solicitud, genera folio |
+| `/ayuda` | Comités | Levantar un ticket de soporte, genera folio |
 | `/estatus FOLIO` | Comités | Consultar estado |
-| `/mis` | Comités | Últimas 10 solicitudes propias |
-| `/pendientes` | Admin | Solicitudes abiertas |
-| `/detalle FOLIO` | Admin | Ficha completa + historial |
-| `/actualizar FOLIO ESTADO [nota]` | Admin | Cambia estado y notifica al comité |
-| `/resumen` | Admin | Conteo por estado |
-| `/export` | Admin | CSV con todo (ábrelo en Excel) |
+| `/mis` | Comités | Últimos 10 tickets propios |
+| `/pendientes` | Soporte | Tickets abiertos |
+| `/detalle FOLIO` | Soporte | Ficha completa + historial + evidencia |
+| `/actualizar FOLIO ESTADO [nota]` | Soporte | Cambia estado y notifica al comité |
+| `/resumen` | Soporte | Conteo por estado |
+| `/export` | Soporte | CSV con todo (ábrelo en Excel) |
+
+El bot también responde a cualquier saludo con una bienvenida y botones (🆘 Necesito ayuda, 🔎 Consultar folio, 📋 Mis tickets), así los comités operan sin teclear comandos.
+
+## Categorías de problema
+
+Se configuran en `db.py` (lista `CATEGORIAS`): no puedo dar de alta un RG, ruta no válida, error del sistema/plataforma, ayuda para dar de alta un RC, y otro.
+
+## Evidencia (fotos/capturas)
+
+En el paso de evidencia, Telegram ofrece **Cámara** (tomar la foto en el momento) o **Galería**. El bot acepta fotos y también imágenes enviadas como archivo. La evidencia se guarda referenciada en Telegram y soporte la ve con `/detalle`.
 
 ## Despliegue en Easypanel (Hostinger)
 
 ### 1. Crear el bot en Telegram
-1. Habla con **@BotFather** → `/newbot` → nombre y username → copia el **token**.
+1. Habla con **@BotFather** → `/newbot` → copia el **token**.
 2. Habla con **@userinfobot** para obtener tu **ID numérico** (para `ADMIN_IDS`).
 
 ### 2. Postgres en Easypanel
-1. En tu proyecto de Easypanel: **+ Service → Postgres**.
-2. Anota usuario, contraseña y el hostname interno (normalmente el nombre del servicio).
-3. Crea la base `representantes` (o usa la default). El bot crea las tablas solo al arrancar.
+1. **+ Service → Postgres**. Anota usuario, contraseña, base y nombre del servicio.
+2. El bot crea las tablas solo al arrancar.
 
 ### 3. La app del bot
-1. **+ Service → App**, fuente: sube este código a un repo Git (GitHub) y conéctalo, o usa "Upload".
-2. Build: **Dockerfile** (ya incluido).
-3. Variables de entorno (pestaña *Environment*):
+1. **+ Service → App**, fuente GitHub (repo conectado), build por **Dockerfile**.
+2. Variables de entorno:
    ```
    BOT_TOKEN=el_token_de_botfather
-   DATABASE_URL=postgresql://usuario:password@nombre-servicio-postgres:5432/representantes
+   DATABASE_URL=postgresql://usuario:password@nombre-servicio-postgres:5432/base
    ADMIN_IDS=tu_id_de_telegram
    ```
-4. Deploy. El bot usa *polling*, así que **no necesita dominio ni puerto expuesto**.
-5. Revisa los logs: debe decir `Base de datos lista` y `Bot iniciando (polling)...`.
+3. Deploy. Usa *polling*: no necesita dominio ni puerto expuesto.
+4. Logs deben decir `Base de datos lista` y `Bot iniciando (polling)...`.
 
 ### 4. Distribuir a los comités
-Comparte el link `t.me/TuBot` en el grupo de WhatsApp de los comités con un mini instructivo: "Para altas/bajas de representantes, entra al bot, manda /nueva y guarda tu folio."
+Comparte `t.me/TuBot` en el grupo de WhatsApp: "Si tienes problemas para dar de alta a tus RG/RC, entra al bot y escribe /ayuda; te damos folio y seguimiento."
 
 ## Buenas prácticas de operación
 
-- **Nada sin folio**: si te piden algo por WhatsApp/llamada, pídeles que lo metan al bot (o mételo tú con /nueva). El folio es tu respaldo.
-- **Cierra el ciclo**: no dejes solicitudes en `PROCESADA`; confirma en el sistema del INE y pásalas a `CONFIRMADA`.
-- **Rechazos siempre con nota**: `/actualizar FOLIO RECHAZADA falta clave de elector`.
-- **Export semanal**: `/export` y guarda el CSV como respaldo/reporte al CDE.
-- **Plazos del INE**: ten a la mano las fechas límite de sustitución de representantes; revisa `/pendientes` a diario conforme se acerque el corte.
+- **Todo por ticket**: si te piden ayuda por WhatsApp/llamada, pídeles que lo metan al bot. El folio es tu respaldo y evita perder casos.
+- **Cierra el ciclo**: no dejes tickets en `EN_ATENCION`; pásalos a `RESUELTO` o `CERRADO`.
+- **Escala con nota**: `/actualizar FOLIO ESCALADO se reportó a sistemas del CDE`.
+- **Export periódico**: `/export` como respaldo y reporte al CDE.
+- **Nota importante**: el bot da soporte, no sustituye la captura oficial; recuérdaselo a los comités para deslindar responsabilidad.
 
 ## Respaldo de la base
-
-En Easypanel el servicio de Postgres tiene opción de backups; actívala. Como mínimo, corre `/export` periódicamente.
+Activa los backups del servicio Postgres en Easypanel. Como mínimo, corre `/export` seguido.

@@ -1,4 +1,4 @@
-"""Capa de acceso a datos (Postgres) para el bot de representantes."""
+"""Capa de acceso a datos (Postgres) para la mesa de ayuda de representantes."""
 import os
 from datetime import datetime
 
@@ -9,20 +9,29 @@ DATABASE_URL = os.environ["DATABASE_URL"]
 
 pool: AsyncConnectionPool | None = None
 
-ESTADOS = ["RECIBIDA", "EN_PROCESO", "PROCESADA", "CONFIRMADA", "RECHAZADA"]
-ESTADOS_ABIERTOS = ["RECIBIDA", "EN_PROCESO", "PROCESADA"]
+ESTADOS = ["RECIBIDO", "EN_ATENCION", "RESUELTO", "ESCALADO", "CERRADO"]
+ESTADOS_ABIERTOS = ["RECIBIDO", "EN_ATENCION", "ESCALADO"]
 
 ESTADO_EMOJI = {
-    "RECIBIDA": "📥",
-    "EN_PROCESO": "⚙️",
-    "PROCESADA": "📤",
-    "CONFIRMADA": "✅",
-    "RECHAZADA": "❌",
+    "RECIBIDO": "📥",
+    "EN_ATENCION": "🛠",
+    "RESUELTO": "✅",
+    "ESCALADO": "⏫",
+    "CERRADO": "🔒",
 }
+
+# Categorías de problema: (código, etiqueta visible)
+CATEGORIAS = [
+    ("RG", "No puedo dar de alta un RG"),
+    ("RUTA", "Ruta no válida / problema de ruta"),
+    ("SISTEMA", "Error del sistema / plataforma"),
+    ("RC", "Ayuda para dar de alta un RC"),
+    ("OTRO", "Otro"),
+]
+CAT_LABEL = {c: l for c, l in CATEGORIAS}
 
 
 async def init_db():
-    """Crea el pool y asegura el esquema."""
     global pool
     pool = AsyncConnectionPool(DATABASE_URL, min_size=1, max_size=5, open=False)
     await pool.open()
@@ -38,37 +47,33 @@ async def close_db():
         await pool.close()
 
 
-def _folio(sol_id: int) -> str:
-    return f"QRO-{datetime.now():%y%m}-{sol_id:04d}"
+def _folio(ticket_id: int) -> str:
+    return f"QRO-{datetime.now():%y%m}-{ticket_id:04d}"
 
 
-async def crear_solicitud(data: dict) -> dict:
-    """Inserta una solicitud, genera folio y registra historial. Devuelve la fila."""
+async def crear_ticket(data: dict) -> dict:
+    """Inserta un ticket, genera folio y registra historial. Devuelve la fila."""
     async with pool.connection() as conn:
         conn.row_factory = dict_row
         cur = await conn.execute(
             """
-            INSERT INTO solicitudes
-              (chat_id, solicitante, comite, tipo_movimiento, tipo_rep,
-               nombre, clave_elector, casilla_ruta, observaciones)
-            VALUES (%(chat_id)s, %(solicitante)s, %(comite)s, %(tipo_movimiento)s,
-                    %(tipo_rep)s, %(nombre)s, %(clave_elector)s, %(casilla_ruta)s,
-                    %(observaciones)s)
+            INSERT INTO tickets
+              (chat_id, solicitante, comite, categoria, descripcion, evidencia_file_id)
+            VALUES (%(chat_id)s, %(solicitante)s, %(comite)s, %(categoria)s,
+                    %(descripcion)s, %(evidencia_file_id)s)
             RETURNING id
             """,
             data,
         )
         row = await cur.fetchone()
-        sol_id = row["id"]
-        folio = _folio(sol_id)
+        tid = row["id"]
+        folio = _folio(tid)
+        await conn.execute("UPDATE tickets SET folio = %s WHERE id = %s", (folio, tid))
         await conn.execute(
-            "UPDATE solicitudes SET folio = %s WHERE id = %s", (folio, sol_id)
+            "INSERT INTO historial (ticket_id, estado, actor) VALUES (%s, 'RECIBIDO', %s)",
+            (tid, data.get("solicitante")),
         )
-        await conn.execute(
-            "INSERT INTO historial (solicitud_id, estado, actor) VALUES (%s, 'RECIBIDA', %s)",
-            (sol_id, data.get("solicitante")),
-        )
-        cur = await conn.execute("SELECT * FROM solicitudes WHERE id = %s", (sol_id,))
+        cur = await conn.execute("SELECT * FROM tickets WHERE id = %s", (tid,))
         return await cur.fetchone()
 
 
@@ -76,16 +81,16 @@ async def obtener_por_folio(folio: str) -> dict | None:
     async with pool.connection() as conn:
         conn.row_factory = dict_row
         cur = await conn.execute(
-            "SELECT * FROM solicitudes WHERE upper(folio) = upper(%s)", (folio,)
+            "SELECT * FROM tickets WHERE upper(folio) = upper(%s)", (folio,)
         )
         return await cur.fetchone()
 
 
-async def solicitudes_de_chat(chat_id: int, limite: int = 10) -> list[dict]:
+async def tickets_de_chat(chat_id: int, limite: int = 10) -> list[dict]:
     async with pool.connection() as conn:
         conn.row_factory = dict_row
         cur = await conn.execute(
-            "SELECT * FROM solicitudes WHERE chat_id = %s ORDER BY id DESC LIMIT %s",
+            "SELECT * FROM tickets WHERE chat_id = %s ORDER BY id DESC LIMIT %s",
             (chat_id, limite),
         )
         return await cur.fetchall()
@@ -95,19 +100,18 @@ async def pendientes() -> list[dict]:
     async with pool.connection() as conn:
         conn.row_factory = dict_row
         cur = await conn.execute(
-            "SELECT * FROM solicitudes WHERE estado = ANY(%s) ORDER BY id",
+            "SELECT * FROM tickets WHERE estado = ANY(%s) ORDER BY id",
             (ESTADOS_ABIERTOS,),
         )
         return await cur.fetchall()
 
 
 async def actualizar_estado(folio: str, estado: str, nota: str | None, actor: str) -> dict | None:
-    """Cambia el estado, guarda historial y devuelve la fila actualizada."""
     async with pool.connection() as conn:
         conn.row_factory = dict_row
         cur = await conn.execute(
             """
-            UPDATE solicitudes
+            UPDATE tickets
                SET estado = %s,
                    nota_admin = COALESCE(%s, nota_admin),
                    actualizada_en = now()
@@ -119,17 +123,17 @@ async def actualizar_estado(folio: str, estado: str, nota: str | None, actor: st
         row = await cur.fetchone()
         if row:
             await conn.execute(
-                "INSERT INTO historial (solicitud_id, estado, nota, actor) VALUES (%s, %s, %s, %s)",
+                "INSERT INTO historial (ticket_id, estado, nota, actor) VALUES (%s, %s, %s, %s)",
                 (row["id"], estado, nota, actor),
             )
         return row
 
 
-async def historial_de(sol_id: int) -> list[dict]:
+async def historial_de(ticket_id: int) -> list[dict]:
     async with pool.connection() as conn:
         conn.row_factory = dict_row
         cur = await conn.execute(
-            "SELECT * FROM historial WHERE solicitud_id = %s ORDER BY fecha", (sol_id,)
+            "SELECT * FROM historial WHERE ticket_id = %s ORDER BY fecha", (ticket_id,)
         )
         return await cur.fetchall()
 
@@ -137,7 +141,7 @@ async def historial_de(sol_id: int) -> list[dict]:
 async def todas() -> list[dict]:
     async with pool.connection() as conn:
         conn.row_factory = dict_row
-        cur = await conn.execute("SELECT * FROM solicitudes ORDER BY id")
+        cur = await conn.execute("SELECT * FROM tickets ORDER BY id")
         return await cur.fetchall()
 
 
@@ -145,6 +149,6 @@ async def resumen() -> list[dict]:
     async with pool.connection() as conn:
         conn.row_factory = dict_row
         cur = await conn.execute(
-            "SELECT estado, count(*) AS n FROM solicitudes GROUP BY estado ORDER BY estado"
+            "SELECT estado, count(*) AS n FROM tickets GROUP BY estado ORDER BY estado"
         )
         return await cur.fetchall()
