@@ -1,12 +1,11 @@
 """Bot de soporte + verificación previa de Telegram para capacitación RG/RC.
 
-Mantiene intacta la mesa de ayuda existente (bot.py) y agrega una Fase 0:
-verificar que el usuario ya puede interactuar correctamente con Telegram.
+La mesa de ayuda existente se conserva en ``bot.py``. Esta entrada agrega una
+Fase 0 basada en un padrón de convocados: cada persona introduce su código único
+y el bot vincula ese registro con su cuenta de Telegram.
 """
-import csv
-import html
-import io
 import logging
+import warnings
 
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
@@ -24,12 +23,15 @@ import bot as soporte
 import verification_db as vdb
 
 log = logging.getLogger("bot_verificacion")
+logging.getLogger("httpx").setLevel(logging.WARNING)  # evita imprimir URLs con BOT_TOKEN
+warnings.filterwarnings("ignore", message=r"If 'per_message=False'.*", category=UserWarning)
 HTML = ParseMode.HTML
 
-VER_MUNICIPIO, VER_CONFIRMACION = range(100, 102)
+VER_CODIGO, VER_CONFIRMACION = range(100, 102)
 
 
 def esc(x) -> str:
+    import html
     return html.escape(str(x)) if x is not None else ""
 
 
@@ -40,20 +42,8 @@ def menu_no_verificado() -> InlineKeyboardMarkup:
     ])
 
 
-def teclado_municipios() -> InlineKeyboardMarkup:
-    filas, fila = [], []
-    for i, nombre in enumerate(soporte.COMITES):
-        fila.append(InlineKeyboardButton(nombre, callback_data=f"vermun:{i}"))
-        if len(fila) == 2:
-            filas.append(fila)
-            fila = []
-    if fila:
-        filas.append(fila)
-    return InlineKeyboardMarkup(filas)
-
-
 async def bienvenida_verificacion(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Entrada principal: si ya está verificado, muestra la mesa de ayuda normal."""
+    """Entrada principal: usuarios ya verificados pasan al menú normal de soporte."""
     u = update.effective_user
     if u and await vdb.esta_verificado(u.id):
         await vdb.tocar(u.id)
@@ -62,17 +52,19 @@ async def bienvenida_verificacion(update: Update, context: ContextTypes.DEFAULT_
     txt = (
         "👋 <b>Bienvenido al Bot de Soporte de Acción Electoral Querétaro.</b>\n\n"
         "Antes de participar en la capacitación necesitamos comprobar que "
-        "<b>Telegram funciona correctamente en tu teléfono</b>.\n\n"
+        "<b>Telegram funciona correctamente en tu teléfono</b> y vincular tu cuenta "
+        "con la lista de personas convocadas.\n\n"
         "Este proceso toma menos de 2 minutos.\n\n"
         "💡 <b>Telegram es gratuito.</b> No necesitas contratar Telegram Premium para usar AcciónMX.\n\n"
-        "Presiona el botón para comenzar."
+        "Ten a la mano tu <b>código de convocatoria</b> y presiona el botón para comenzar."
     )
     dest = update.message or (update.callback_query and update.callback_query.message)
     await dest.reply_text(txt, parse_mode=HTML, reply_markup=menu_no_verificado())
 
 
 async def verificar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.pop("ver_municipio", None)
+    context.user_data.pop("convocado_id", None)
+    context.user_data.pop("codigo_verificacion", None)
     if update.callback_query:
         await update.callback_query.answer()
         dest = update.callback_query.message
@@ -80,13 +72,14 @@ async def verificar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         dest = update.message
 
     u = update.effective_user
-    if await vdb.esta_verificado(u.id):
-        row = await vdb.obtener(u.id)
+    existente = await vdb.obtener_por_telegram(u.id)
+    if existente and existente.get("telegram_verificado"):
         await dest.reply_text(
             "✅ <b>Tu Telegram ya está verificado.</b>\n\n"
-            f"Nombre: {esc(row['nombre'])}\n"
-            f"Municipio: {esc(row['municipio'])}\n"
-            f"Fecha: {row['fecha_verificacion']:%d/%m/%Y %H:%M}\n\n"
+            f"<b>Código:</b> <code>{esc(existente['codigo_verificacion'])}</code>\n"
+            f"<b>Nombre:</b> {esc(existente['nombre_completo'])}\n"
+            f"<b>Municipio:</b> {esc(existente['municipio'])}\n"
+            f"<b>Fecha:</b> {existente['fecha_verificacion']:%d/%m/%Y %H:%M}\n\n"
             "Ya estás listo para la capacitación.",
             parse_mode=HTML,
         )
@@ -94,33 +87,60 @@ async def verificar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await dest.reply_text(
         "✅ <b>Verificación de Telegram</b>\n\n"
-        "Paso 1 de 2: selecciona tu <b>municipio</b>.",
-        parse_mode=HTML,
-        reply_markup=teclado_municipios(),
-    )
-    return VER_MUNICIPIO
-
-
-async def paso_ver_municipio(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    idx = int(q.data.split(":")[1])
-    municipio = soporte.COMITES[idx]
-    context.user_data["ver_municipio"] = municipio
-
-    await q.edit_message_text(
-        f"Municipio: <b>{esc(municipio)}</b>",
+        "Escribe tu <b>código de convocatoria</b>.\n\n"
+        "Ejemplo: <code>COR-00015</code>\n\n"
+        "El código aparece en la lista o mensaje de convocatoria que te proporciona tu coordinación.",
         parse_mode=HTML,
     )
-    await q.message.reply_text(
-        "Paso 2 de 2:\n\n"
-        "Si puedes leer este mensaje y tocar el botón de abajo, "
-        "tu Telegram está funcionando correctamente.\n\n"
-        "Presiona <b>Confirmar</b> para terminar.",
+    return VER_CODIGO
+
+
+async def paso_ver_codigo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    codigo = vdb.normalizar_codigo(update.message.text)
+    row = await vdb.obtener_codigo(codigo)
+    if not row:
+        await update.message.reply_text(
+            "❌ <b>No encontré ese código.</b>\n\n"
+            "Revísalo e inténtalo nuevamente. Escríbelo completo, por ejemplo "
+            "<code>COR-00015</code>.\n\n"
+            "Si no tienes código, usa /cancelar y solicita apoyo a tu coordinación.",
+            parse_mode=HTML,
+        )
+        return VER_CODIGO
+
+    u = update.effective_user
+    if row.get("telegram_id") and row["telegram_id"] != u.id:
+        await update.message.reply_text(
+            "⚠️ <b>Ese código ya está vinculado a otra cuenta de Telegram.</b>\n\n"
+            "Por seguridad no puedo reutilizarlo. Solicita apoyo con /ayuda.",
+            parse_mode=HTML,
+        )
+        return ConversationHandler.END
+
+    if row.get("telegram_verificado") and row.get("telegram_id") == u.id:
+        await update.message.reply_text(
+            "✅ Este código ya está verificado con tu cuenta.\n"
+            "Usa /miverificacion para consultar tus datos."
+        )
+        return ConversationHandler.END
+
+    context.user_data["convocado_id"] = row["id"]
+    context.user_data["codigo_verificacion"] = row["codigo_verificacion"]
+
+    cargo = row.get("cargo") or "—"
+    seccion = row.get("seccion") or "—"
+    await update.message.reply_text(
+        "🔎 <b>Encontré tu registro.</b>\n\n"
+        f"<b>Código:</b> <code>{esc(row['codigo_verificacion'])}</code>\n"
+        f"<b>Nombre:</b> {esc(row['nombre_completo'])}\n"
+        f"<b>Municipio:</b> {esc(row['municipio'])}\n"
+        f"<b>Cargo:</b> {esc(cargo)}\n"
+        f"<b>Sección:</b> {esc(seccion)}\n\n"
+        "¿Estos datos corresponden a ti?",
         parse_mode=HTML,
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ CONFIRMAR QUE VEO ESTE MENSAJE", callback_data="ver:confirmar")],
-            [InlineKeyboardButton("↩️ Cambiar municipio", callback_data="ver:cambiar")],
+            [InlineKeyboardButton("✅ SÍ, SOY YO", callback_data="ver:si")],
+            [InlineKeyboardButton("❌ NO SON MIS DATOS", callback_data="ver:no")],
         ]),
     )
     return VER_CONFIRMACION
@@ -130,46 +150,65 @@ async def paso_ver_confirmacion(update: Update, context: ContextTypes.DEFAULT_TY
     q = update.callback_query
     await q.answer()
 
-    if q.data == "ver:cambiar":
-        await q.message.reply_text(
-            "Selecciona nuevamente tu municipio:",
-            reply_markup=teclado_municipios(),
+    if q.data == "ver:no":
+        context.user_data.pop("convocado_id", None)
+        context.user_data.pop("codigo_verificacion", None)
+        await q.edit_message_text(
+            "Verificación cancelada. No se vinculó ninguna cuenta.\n\n"
+            "Revisa tu código y usa /verificar para intentar nuevamente."
         )
-        return VER_MUNICIPIO
-
-    u = update.effective_user
-    municipio = context.user_data.get("ver_municipio")
-    if not municipio:
-        await q.message.reply_text("No pude recuperar el municipio. Usa /verificar para comenzar otra vez.")
         return ConversationHandler.END
 
-    row = await vdb.guardar_verificacion(
-        telegram_id=u.id,
-        chat_id=update.effective_chat.id,
-        username=u.username,
-        nombre=u.full_name,
-        municipio=municipio,
-    )
-    context.user_data.pop("ver_municipio", None)
+    convocado_id = context.user_data.get("convocado_id")
+    if not convocado_id:
+        await q.message.reply_text("No pude recuperar tu registro. Usa /verificar para comenzar otra vez.")
+        return ConversationHandler.END
+
+    u = update.effective_user
+    try:
+        row = await vdb.vincular_convocado(
+            convocado_id=convocado_id,
+            telegram_id=u.id,
+            username=u.username,
+            telegram_nombre=u.full_name,
+        )
+    except Exception as exc:
+        log.exception("Error vinculando convocado %s: %s", convocado_id, exc)
+        await q.edit_message_text(
+            "⚠️ No pude completar la verificación. Puede existir otra vinculación con tu cuenta. "
+            "Solicita apoyo con /ayuda."
+        )
+        return ConversationHandler.END
+
+    context.user_data.pop("convocado_id", None)
+    context.user_data.pop("codigo_verificacion", None)
+
+    if not row:
+        await q.edit_message_text(
+            "⚠️ Este código ya quedó asociado a otra cuenta. Solicita apoyo con /ayuda."
+        )
+        return ConversationHandler.END
 
     await q.edit_message_text(
         "✅ <b>TELEGRAM VERIFICADO CORRECTAMENTE</b>\n\n"
-        "Tu cuenta está funcionando y ya estás listo para participar en la capacitación de Acción Electoral.\n\n"
-        f"<b>Nombre:</b> {esc(row['nombre'])}\n"
+        "Tu cuenta quedó vinculada con la lista oficial de convocados.\n\n"
+        f"<b>Código:</b> <code>{esc(row['codigo_verificacion'])}</code>\n"
+        f"<b>Nombre:</b> {esc(row['nombre_completo'])}\n"
         f"<b>Municipio:</b> {esc(row['municipio'])}\n\n"
-        "A partir de ahora también puedes usar este bot cuando necesites soporte técnico.",
+        "Ya estás listo para participar en la capacitación de Acción Electoral.",
         parse_mode=HTML,
     )
 
-    # Aviso a soporte para que pueda llevar el control previo de participantes.
     usuario = f"@{u.username}" if u.username else "sin username"
     for admin_id in soporte.ADMIN_IDS:
         try:
             await context.bot.send_message(
                 admin_id,
-                "✅ <b>Nuevo usuario verificado en Telegram</b>\n\n"
-                f"<b>Nombre:</b> {esc(u.full_name)}\n"
-                f"<b>Municipio:</b> {esc(municipio)}\n"
+                "✅ <b>Convocado verificado en Telegram</b>\n\n"
+                f"<b>Código:</b> <code>{esc(row['codigo_verificacion'])}</code>\n"
+                f"<b>Nombre:</b> {esc(row['nombre_completo'])}\n"
+                f"<b>Municipio:</b> {esc(row['municipio'])}\n"
+                f"<b>Cargo:</b> {esc(row.get('cargo') or '—')}\n"
                 f"<b>Usuario:</b> {esc(usuario)}\n"
                 f"<b>Telegram ID:</b> <code>{u.id}</code>",
                 parse_mode=HTML,
@@ -185,17 +224,18 @@ async def paso_ver_confirmacion(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def mi_verificacion(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    u = update.effective_user
-    row = await vdb.obtener(u.id)
-    if not row or row.get("estado") != "VERIFICADO":
+    row = await vdb.obtener_por_telegram(update.effective_user.id)
+    if not row or not row.get("telegram_verificado"):
         await update.message.reply_text(
             "⚠️ Aún no has completado la verificación. Usa /verificar para comenzar."
         )
         return
     await update.message.reply_text(
         "✅ <b>Telegram verificado</b>\n\n"
-        f"Nombre: {esc(row['nombre'])}\n"
+        f"Código: <code>{esc(row['codigo_verificacion'])}</code>\n"
+        f"Nombre: {esc(row['nombre_completo'])}\n"
         f"Municipio: {esc(row['municipio'])}\n"
+        f"Cargo: {esc(row.get('cargo') or '—')}\n"
         f"Fecha: {row['fecha_verificacion']:%d/%m/%Y %H:%M}",
         parse_mode=HTML,
     )
@@ -204,17 +244,33 @@ async def mi_verificacion(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def verificados(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not soporte.es_admin(update):
         return
-    filas = await vdb.listar(50)
+    filas = await vdb.listar_verificados(50)
     if not filas:
-        await update.message.reply_text("Todavía no hay usuarios verificados.")
+        await update.message.reply_text("Todavía no hay convocados verificados.")
         return
     lineas = [
-        f"✅ {esc(r['nombre'])} — {esc(r['municipio'])}"
-        + (f" — @{esc(r['username'])}" if r.get("username") else "")
+        f"✅ <code>{esc(r['codigo_verificacion'])}</code> — {esc(r['nombre_completo'])} — {esc(r['municipio'])}"
         for r in filas
     ]
     await update.message.reply_text(
-        f"<b>Últimos {len(filas)} usuarios verificados:</b>\n\n" + "\n".join(lineas),
+        f"<b>Últimos {len(filas)} convocados verificados:</b>\n\n" + "\n".join(lineas),
+        parse_mode=HTML,
+    )
+
+
+async def pendientes_verificacion(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not soporte.es_admin(update):
+        return
+    filas = await vdb.listar_pendientes(50)
+    if not filas:
+        await update.message.reply_text("🎉 No hay convocados pendientes de verificar.")
+        return
+    lineas = [
+        f"⏳ <code>{esc(r['codigo_verificacion'])}</code> — {esc(r['nombre_completo'])} — {esc(r['municipio'])}"
+        for r in filas
+    ]
+    await update.message.reply_text(
+        f"<b>{len(filas)} pendientes (máximo 50):</b>\n\n" + "\n".join(lineas),
         parse_mode=HTML,
     )
 
@@ -222,14 +278,26 @@ async def verificados(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def resumen_verificacion(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not soporte.es_admin(update):
         return
+    general = await vdb.resumen_general()
+    total = general["total"] or 0
+    ver = general["verificados"] or 0
+    pen = general["pendientes"] or 0
+    pct = (ver / total * 100) if total else 0
     filas = await vdb.resumen_municipio()
-    total = sum(r["n"] for r in filas)
-    if not filas:
-        await update.message.reply_text("Todavía no hay usuarios verificados.")
-        return
-    lineas = [f"{esc(r['municipio'])}: <b>{r['n']}</b>" for r in filas]
+    lineas = []
+    for r in filas:
+        p = (r["verificados"] / r["total"] * 100) if r["total"] else 0
+        lineas.append(
+            f"{esc(r['municipio'])}: <b>{r['verificados']}/{r['total']}</b> ({p:.1f}%) — pendientes {r['pendientes']}"
+        )
+    detalle = "\n".join(lineas) if lineas else "Aún no se ha cargado el padrón."
     await update.message.reply_text(
-        f"✅ <b>Telegram verificado: {total}</b>\n\n" + "\n".join(lineas),
+        "📊 <b>Control de verificación</b>\n\n"
+        f"Convocados: <b>{total}</b>\n"
+        f"Telegram verificado: <b>{ver}</b>\n"
+        f"Pendientes: <b>{pen}</b>\n"
+        f"Avance: <b>{pct:.1f}%</b>\n\n"
+        f"<b>Por municipio:</b>\n{detalle}",
         parse_mode=HTML,
     )
 
@@ -239,14 +307,13 @@ async def export_verificacion(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     filas = await vdb.todas()
     if not filas:
-        await update.message.reply_text("No hay usuarios verificados que exportar.")
+        await update.message.reply_text("No hay convocados que exportar.")
         return
     data = vdb.csv_bytes(filas)
-    await update.message.reply_document(data, caption=f"{len(filas)} usuarios verificados")
+    await update.message.reply_document(data, caption=f"{len(filas)} convocados")
 
 
 async def texto_suelto(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Mantiene el comportamiento amigable del bot según el estado de verificación."""
     u = update.effective_user
     if u and await vdb.esta_verificado(u.id):
         await vdb.tocar(u.id)
@@ -261,7 +328,7 @@ async def post_init(app: Application):
     log.info("Bases de datos listas.")
     await app.bot.set_my_commands([
         BotCommand("start", "Inicio"),
-        BotCommand("verificar", "Verificar que Telegram funciona"),
+        BotCommand("verificar", "Verificar mi Telegram con mi código"),
         BotCommand("miverificacion", "Consultar mi verificación"),
         BotCommand("ayuda", "Levantar un ticket de soporte"),
         BotCommand("estatus", "Consultar un folio"),
@@ -290,8 +357,8 @@ def main():
             CallbackQueryHandler(verificar, pattern=r"^ver:iniciar$"),
         ],
         states={
-            VER_MUNICIPIO: [CallbackQueryHandler(paso_ver_municipio, pattern=r"^vermun:")],
-            VER_CONFIRMACION: [CallbackQueryHandler(paso_ver_confirmacion, pattern=r"^ver:(confirmar|cambiar)$")],
+            VER_CODIGO: [MessageHandler(filters.TEXT & ~filters.COMMAND, paso_ver_codigo)],
+            VER_CONFIRMACION: [CallbackQueryHandler(paso_ver_confirmacion, pattern=r"^ver:(si|no)$")],
         },
         fallbacks=[CommandHandler("cancelar", soporte.cancelar)],
     )
@@ -327,6 +394,7 @@ def main():
     app.add_handler(CommandHandler("resumen", soporte.resumen_cmd))
     app.add_handler(CommandHandler("export", soporte.export))
     app.add_handler(CommandHandler("verificados", verificados))
+    app.add_handler(CommandHandler("pendientes_verificacion", pendientes_verificacion))
     app.add_handler(CommandHandler("resumen_verificacion", resumen_verificacion))
     app.add_handler(CommandHandler("export_verificacion", export_verificacion))
     app.add_handler(CallbackQueryHandler(soporte.menu_go, pattern=r"^go:(estatus|mis)$"))
@@ -336,8 +404,7 @@ def main():
         log.exception("Excepción en un handler", exc_info=context.error)
 
     app.add_error_handler(on_error)
-
-    log.info("Bot soporte + verificación iniciando (polling)...")
+    log.info("Bot soporte + padrón + verificación iniciando (polling)...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
